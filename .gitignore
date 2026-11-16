@@ -1,0 +1,106 @@
+# Secrets & credentials
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+*.crt
+*.cer
+*.der
+*.jks
+*.keystore
+*.gpg
+*.asc
+id_rsa*
+id_ed25519*
+id_ecdsa*
+.npmrc
+.netrc
+credentials*.json
+secrets*.json
+*.secret
+*.secrets
+
+# Context dumps (may contain prompts, code, and session data)
+*.context.json
+
+# pi
+.pi/
+auth.json
+sessions/
+context-dumps/
+
+# Claude Code
+.claude/
+CLAUDE.local.md
+
+# Other AI tools
+.cursor/
+.aider*
+.codex/
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+Icon?
+._*
+.DocumentRevisions-V100
+.fseventsd
+.Spotlight-V100
+.TemporaryItems
+.Trashes
+.VolumeIcon.icns
+.com.apple.timemachine.donotpresent
+.AppleDB
+.AppleDesktop
+Network Trash Folder
+Temporary Items
+.apdisk
+
+# Windows / Linux
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+*~
+.directory
+.Trash-*
+
+# Editors & IDEs
+.vscode/
+.idea/
+*.swp
+*.swo
+*.sublime-workspace
+*.code-workspace
+
+# Node
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+.pnpm-store/
+*.tgz
+.npm/
+.yarn/
+
+# Build & cache
+dist/
+build/
+out/
+coverage/
+.cache/
+.eslintcache
+*.tsbuildinfo
+
+# Logs & temp
+logs/
+*.log
+tmp/
+temp/
+*.tmp
+*.bak
