@@ -18,9 +18,10 @@
  *   /context path       Show where the last dump was written
  *   /context off|on     Toggle capture
  *
- * The tree explorer is structure-agnostic: it walks whatever JSON the provider got.
- * The usage summary maps the payload onto Claude Code-style categories via the rules in
- * BUCKETS / SECTION_BUCKETS / *_KEYS below; anything unrecognised is counted as "Other".
+ * The tree explorer is structure-agnostic: it shows whatever JSON the provider got.
+ * Token numbers count only what reaches the model's context (see "Context accounting"):
+ * request params, ids, type tags and cache markers are shown but cost nothing ("—"), and
+ * thinking is costed from its encrypted signature rather than the summarized text.
  */
 
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
@@ -179,12 +180,31 @@ function describe(obj: Record<string, unknown>): string {
 	return label.trim();
 }
 
-/** Approximate token cost of one image/binary blob (Anthropic: ~1.6k tokens for a ~1MP image). */
-const BLOB_TOKENS = 1600;
+// ── Context accounting ──
+// The payload is JSON, but the model never sees JSON: the provider renders it into its own prompt
+// format. So we count what the model actually reads, not the request body:
+//   - text content (system prompt, message text, tool results): chars × a calibrated tokens/char
+//   - tool definitions and tool-call arguments: their JSON (that is how they are rendered)
+//   - images: estimated from pixel dimensions
+//   - thinking: estimated from the encrypted signature (see SIG_* below)
+//   - NOT counted: request params (model, max_tokens, betas, …), ids, `type` tags, cache markers.
+// When the provider reports real usage, chars→tokens is calibrated so the categories sum to it.
 
-// ── Usage buckets (Claude Code-style categories) ──
-// Each string in the payload is attributed to one bucket based on where it sits. Anything the
-// rules don't recognise lands in "Other", so unknown payload shapes still add up correctly.
+/** Fallback token cost of one image/binary blob when its dimensions can't be read. */
+const BLOB_TOKENS = 1600;
+/** Rough per-message framing cost (role markers etc.), in tokens. */
+const MSG_OVERHEAD = 3;
+/** Anthropic injects a hidden tool-use system prompt when tools are present (Claude 4: ~346 tokens). */
+const ANTHROPIC_TOOL_PROMPT = 346;
+/**
+ * Anthropic returns *summarized* thinking text; the full thinking lives encrypted in `signature`,
+ * and that full thinking is what counts as input on later requests (the summary does not).
+ * Fitted against real usage deltas: tokens ≈ (signature chars − 830) / 3.6.
+ */
+const SIG_BASE = 830;
+const SIG_CHARS_PER_TOKEN = 3.6;
+/** Anthropic models that drop thinking from earlier turns (Opus 4.5+ keep it). */
+const STRIPS_OLD_THINKING = /claude-3|claude-(opus|sonnet)-4(-[01])?(-\d{8})?$|claude-(sonnet|haiku)-4-5/;
 
 const BUCKETS = [
 	{ name: "System prompt", color: "muted" },
@@ -194,17 +214,32 @@ const BUCKETS = [
 	{ name: "Memory files", color: "syntaxNumber" },
 	{ name: "Skills", color: "warning" },
 	{ name: "Messages", color: "syntaxKeyword" },
+	{ name: "Thinking", color: "syntaxFunction" },
 	{ name: "Compaction summary", color: "syntaxString" },
 	{ name: "Other", color: "dim" },
 ] as const;
 type Bucket = (typeof BUCKETS)[number]["name"];
 
-/** Top-level payload keys by role (Anthropic, OpenAI chat/responses, Gemini). */
+/** Top-level payload keys by role (Anthropic, OpenAI chat/responses, Gemini). Anything else is a request param. */
 const SYSTEM_KEYS = /^(system|systemInstruction|system_instruction|instructions)$/;
 const TOOL_KEYS = /^(tools|functions)$/;
 const MESSAGE_KEYS = /^(messages|contents|input)$/;
 /** Message roles that carry system prompt text inside the message list. */
 const SYSTEM_ROLES = new Set(["system", "developer"]);
+/** Protocol metadata inside messages that the model never reads as text. */
+const NON_CONTEXT_KEYS = new Set([
+	"type", "id", "role", "tool_use_id", "tool_call_id", "call_id", "cache_control", "is_error", "status",
+	"index", "media_type", "mime_type", "mimeType", "signature", "thoughtSignature", "thought_signature",
+	"encrypted_content", "output_config",
+]);
+/** Transport flags on tool definitions that are not rendered into the prompt. */
+const TOOL_META_KEYS = new Set(["cache_control", "eager_input_streaming", "strict", "defer_loading"]);
+/** Model-emitted arguments that are rendered as JSON. */
+const JSON_ARG_KEYS = new Set(["input", "args"]);
+/** Block types holding reasoning: Anthropic thinking / redacted_thinking, OpenAI responses reasoning. */
+const THINKING_TYPES = new Set(["thinking", "redacted_thinking", "reasoning"]);
+/** Block types that are tool plumbing rather than a new user turn. */
+const TOOL_RESULT_TYPES = new Set(["tool_result", "function_call_output", "functionResponse"]);
 /** pi system prompt sections (`<name>…</name>`) that get their own bucket. */
 const SECTION_BUCKETS: Record<string, Bucket> = {
 	project_context: "Memory files",
@@ -219,95 +254,218 @@ const COMPACTION_MARKERS = [
 	"The following is a summary of a branch",
 ];
 
-interface BucketStats {
-	chars: Map<Bucket, number>;
-	counts: Map<Bucket, { n: number; unit: string }>;
+/** Image tokens from pixel dimensions (Anthropic: w·h/750 after fitting 1568px / 1.15MP). */
+function imageTokens(s: string): number {
+	try {
+		const b = Buffer.from(s.replace(/^data:[^,]*,/, "").slice(0, 65536), "base64");
+		let w = 0;
+		let h = 0;
+		if (b.length > 24 && b.readUInt32BE(0) === 0x89504e47) {
+			w = b.readUInt32BE(16);
+			h = b.readUInt32BE(20);
+		} else if (b.length > 10 && b.toString("ascii", 0, 4) === "GIF8") {
+			w = b.readUInt16LE(6);
+			h = b.readUInt16LE(8);
+		} else if (b[0] === 0xff && b[1] === 0xd8) {
+			for (let i = 2; i + 9 < b.length && b[i] === 0xff; ) {
+				const m = b[i + 1]!;
+				if (m >= 0xc0 && m <= 0xcf && m !== 0xc4 && m !== 0xc8 && m !== 0xcc) {
+					h = b.readUInt16BE(i + 5);
+					w = b.readUInt16BE(i + 7);
+					break;
+				}
+				i += 2 + b.readUInt16BE(i + 2);
+			}
+		}
+		if (!w || !h) return BLOB_TOKENS;
+		const scale = Math.min(1, 1568 / Math.max(w, h), Math.sqrt(1_150_000 / (w * h)));
+		return Math.ceil((w * scale * h * scale) / 750);
+	} catch {
+		return BLOB_TOKENS;
+	}
 }
 
-function classify(payload: unknown, size: (v: unknown) => number): BucketStats {
-	const chars = new Map<Bucket, number>();
+/** A cost is text chars (scaled by the calibrated tokens/char) plus directly estimated tokens. */
+interface Cost {
+	chars: number;
+	fixed: number;
+}
+
+interface Analysis {
+	/** Cost per payload node (keyed by full dump path); payload nodes not listed cost nothing. */
+	nodes: Map<string, Cost>;
+	buckets: Map<Bucket, Cost>;
+	counts: Map<Bucket, { n: number; unit: string }>;
+	total: Cost;
+	/** Top-level request params that are not part of the context. */
+	params: string[];
+	/** Thinking blocks the provider drops (earlier turns). */
+	dropped: number;
+}
+
+function analyze(payload: unknown, base: Path, meta: Record<string, unknown>): Analysis {
+	const nodes = new Map<string, Cost>();
+	const buckets = new Map<Bucket, Cost>();
 	const counts = new Map<Bucket, { n: number; unit: string }>();
-	const add = (b: Bucket, n: number) => chars.set(b, (chars.get(b) ?? 0) + n);
+	const total: Cost = { chars: 0, fixed: 0 };
+	const params: string[] = [];
+	let dropped = 0;
+	const model = String(meta.model ?? "");
+	const anthropic = /anthropic/.test(String(meta.api ?? meta.provider ?? "")) || model.startsWith("claude");
+
+	const zero = (): Cost => ({ chars: 0, fixed: 0 });
+	const sum = (a: Cost, b: Cost) => {
+		a.chars += b.chars;
+		a.fixed += b.fixed;
+		return a;
+	};
+	const add = (b: Bucket, c: Cost) => {
+		buckets.set(b, sum(buckets.get(b) ?? zero(), c));
+		sum(total, c);
+		return c;
+	};
 	const count = (b: Bucket, n: number, unit: string) => {
 		if (n > 0) counts.set(b, { n: (counts.get(b)?.n ?? 0) + n, unit });
 	};
-	const keyCost = (k: string | number) => (typeof k === "string" ? k.length + 4 : 1);
+	const rec = (p: Path, c: Cost) => {
+		nodes.set(pathId(p), c);
+		return c;
+	};
 
 	/** System prompt text: carve out pi's tagged sections into their own buckets. */
-	const addSystemText = (s: string) => {
-		let rest = s.length + 2;
+	const systemText = (s: string): Cost => {
+		let rest = s.length;
 		for (const m of s.matchAll(/<([a-z][a-z0-9_-]*)>\n[\s\S]*?\n<\/\1>/g)) {
 			const b = SECTION_BUCKETS[m[1]!];
 			if (!b) continue;
-			add(b, m[0].length);
+			add(b, { chars: m[0].length, fixed: 0 });
 			rest -= m[0].length;
 			if (b === "Skills") count(b, m[0].match(/<skill>/g)?.length ?? 0, "skills");
 			if (b === "Memory files") count(b, m[0].match(/<project_instructions /g)?.length ?? 0, "files");
 		}
-		add("System prompt", rest);
+		add("System prompt", { chars: rest, fixed: 0 });
+		return { chars: s.length, fixed: 0 };
 	};
 
-	type Mode = "system" | "message" | "plain";
-	const walk = (v: unknown, bucket: Bucket, mode: Mode) => {
+	/** Reasoning block: cost is the full thinking, best estimated from its encrypted form. */
+	const thinking = (blk: Record<string, unknown>, p: Path, drop: boolean): Cost => {
+		count("Thinking", 1, "blocks");
+		if (drop) {
+			dropped++;
+			return rec(p, zero());
+		}
+		const encKey = ["signature", "data", "encrypted_content"].find((k) => typeof blk[k] === "string");
+		const enc = encKey ? (blk[encKey] as string) : "";
+		const encTok = Math.max(0, (enc.length - SIG_BASE) / SIG_CHARS_PER_TOKEN);
+		const text = typeof blk.thinking === "string" ? blk.thinking : "";
+		// Older models return the full thinking with a short signature; use whichever is larger.
+		if (encKey && encTok >= text.length / CHARS_PER_TOKEN) {
+			return rec(p, add("Thinking", rec([...p, encKey], { chars: 0, fixed: encTok })));
+		}
+		if (text) return rec(p, add("Thinking", rec([...p, "thinking"], { chars: text.length, fixed: 0 })));
+		const c = zero(); // e.g. reasoning with only a summary
+		for (const [k, x] of Object.entries(blk)) if (!NON_CONTEXT_KEYS.has(k)) sum(c, walk(x, [...p, k], "Thinking", "text", false));
+		return rec(p, c);
+	};
+
+	type Mode = "text" | "system" | "json";
+	const walk = (v: unknown, p: Path, bucket: Bucket, mode: Mode, drop: boolean): Cost => {
 		if (typeof v === "string") {
-			if (mode === "system" && !blobLabel(v)) return addSystemText(v);
-			if (mode === "message" && COMPACTION_MARKERS.some((p) => v.slice(0, 200).includes(p)))
-				return add("Compaction summary", size(v));
-			return add(bucket, size(v));
+			if (blobLabel(v)) return rec(p, add(bucket, { chars: 0, fixed: imageTokens(v) }));
+			if (mode === "system") return rec(p, systemText(v));
+			if (mode === "json") return rec(p, add(bucket, { chars: JSON.stringify(v).length, fixed: 0 }));
+			const b = bucket === "Messages" && COMPACTION_MARKERS.some((m) => v.slice(0, 200).includes(m)) ? "Compaction summary" : bucket;
+			return rec(p, add(b, { chars: v.length, fixed: 0 }));
 		}
-		if (!isObj(v)) return add(bucket, size(v));
-		// A system/developer message inside the message list counts as system prompt.
-		if (mode === "message" && !Array.isArray(v) && SYSTEM_ROLES.has(v.role as string)) {
-			bucket = "System prompt";
-			mode = "system";
+		if (!isObj(v)) return mode === "json" ? rec(p, add(bucket, { chars: String(v).length, fixed: 0 })) : zero();
+		if (mode !== "json" && !Array.isArray(v) && THINKING_TYPES.has(v.type as string)) return thinking(v, p, drop);
+		const c = zero();
+		const list = entries(v);
+		if (mode === "json") {
+			const punct = 2 + list.reduce((n, [k]) => n + (typeof k === "string" ? k.length + 4 : 1), 0);
+			sum(c, add(bucket, { chars: punct, fixed: 0 }));
 		}
-		let overhead = 2;
-		for (const [k, x] of entries(v)) {
-			overhead += keyCost(k);
-			walk(x, bucket, mode);
+		for (const [k, x] of list) {
+			if (mode !== "json" && typeof k === "string" && NON_CONTEXT_KEYS.has(k)) continue;
+			const m = mode !== "json" && typeof k === "string" && JSON_ARG_KEYS.has(k) && isObj(x) ? "json" : mode;
+			sum(c, walk(x, [...p, k], bucket, m, drop));
 		}
-		add(bucket, overhead);
+		return rec(p, c);
+	};
+
+	const isUserTurn = (m: unknown) => {
+		if (!isObj(m) || Array.isArray(m) || m.role !== "user") return false;
+		const c = m.content ?? m.parts;
+		if (!Array.isArray(c)) return true;
+		return c.some((b) => !(isObj(b) && !Array.isArray(b) && (TOOL_RESULT_TYPES.has(b.type as string) || "functionResponse" in b)));
+	};
+
+	const walkMessages = (msgs: unknown, p: Path): Cost => {
+		if (!Array.isArray(msgs)) return walk(msgs, p, "Messages", "text", false);
+		let lastUser = -1;
+		msgs.forEach((m, i) => isUserTurn(m) && (lastUser = i));
+		const c = zero();
+		msgs.forEach((m, i) => {
+			const mp = [...p, i];
+			const obj = isObj(m) && !Array.isArray(m) ? m : undefined;
+			const sys = !!obj && SYSTEM_ROLES.has(obj.role as string);
+			const bucket: Bucket = sys ? "System prompt" : "Messages";
+			// Earlier-turn reasoning is dropped by OpenAI and by older Claude models.
+			const drop = i < lastUser && (obj?.type === "reasoning" || (anthropic && STRIPS_OLD_THINKING.test(model)));
+			const mc = { ...walk(m, mp, bucket, sys ? "system" : "text", drop) };
+			if (mc.chars + mc.fixed > 0) {
+				add(bucket, { chars: 0, fixed: MSG_OVERHEAD });
+				mc.fixed += MSG_OVERHEAD;
+				rec(mp, mc);
+			}
+			if (!sys) count("Messages", 1, "messages");
+			sum(c, mc);
+		});
+		return rec(p, c);
 	};
 
 	/** Tools: one bucket per tool, MCP vs built-in by name. Handles Gemini's nested declarations. */
-	const walkTools = (tools: unknown) => {
-		if (!Array.isArray(tools)) return walk(tools, "System tools", "plain");
-		add("System tools", 2 + tools.length);
-		for (const t of tools) {
+	const walkTools = (tools: unknown, p: Path): Cost => {
+		if (!Array.isArray(tools)) return walk(tools, p, "System tools", "json", false);
+		const c = zero();
+		tools.forEach((t, i) => {
+			const tp = [...p, i];
 			const obj = isObj(t) && !Array.isArray(t) ? t : {};
-			const nested = Object.values(obj).find(
-				(x) => Array.isArray(x) && x.length > 0 && x.every((d) => isObj(d) && typeof (d as any).name === "string"),
+			const nested = Object.entries(obj).find(
+				([, x]) => Array.isArray(x) && x.length > 0 && x.every((d) => isObj(d) && typeof (d as any).name === "string"),
 			);
 			if (!obj.name && nested) {
-				walkTools(nested);
-				continue;
+				sum(c, rec(tp, { ...walkTools(nested[1], [...tp, nested[0]]) }));
+				return;
 			}
-			const name =
-				shortString(obj.name) ?? shortString((obj.function as Record<string, unknown> | undefined)?.name) ?? "";
+			const name = shortString(obj.name) ?? shortString((obj.function as Record<string, unknown> | undefined)?.name) ?? "";
 			const b: Bucket = isMcpTool(name) ? "MCP tools" : "System tools";
-			add(b, size(t));
+			const tc = add(b, { chars: 2, fixed: 0 });
+			for (const [k, x] of Object.entries(obj)) {
+				if (TOOL_META_KEYS.has(k)) continue;
+				sum(tc, add(b, { chars: k.length + 4, fixed: 0 }));
+				sum(tc, walk(x, [...tp, k], b, "json", false));
+			}
 			count(b, 1, "tools");
-		}
+			sum(c, rec(tp, { ...tc }));
+		});
+		if (anthropic && tools.length > 0) sum(c, add("System tools", { chars: 0, fixed: ANTHROPIC_TOOL_PROMPT }));
+		return rec(p, c);
 	};
 
 	if (!isObj(payload) || Array.isArray(payload)) {
-		walk(payload, "Other", "plain");
-		return { chars, counts };
+		rec(base, { ...walk(payload, base, "Other", "text", false) });
+	} else {
+		for (const [k, v] of Object.entries(payload)) {
+			const p = [...base, k];
+			if (TOOL_KEYS.test(k)) walkTools(v, p);
+			else if (SYSTEM_KEYS.test(k)) walk(v, p, "System prompt", "system", false);
+			else if (MESSAGE_KEYS.test(k)) walkMessages(v, p);
+			else params.push(k);
+		}
+		rec(base, { ...total });
 	}
-	add("Other", 2);
-	for (const [k, v] of Object.entries(payload)) {
-		add("Other", keyCost(k));
-		if (TOOL_KEYS.test(k)) walkTools(v);
-		else if (SYSTEM_KEYS.test(k)) walk(v, "System prompt", "system");
-		else if (MESSAGE_KEYS.test(k)) {
-			walk(v, "Messages", "message");
-			if (Array.isArray(v)) {
-				const n = v.filter((m) => !(isObj(m) && SYSTEM_ROLES.has((m as any).role))).length;
-				count("Messages", n, "messages");
-			}
-		} else walk(v, "Other", "plain");
-	}
-	return { chars, counts };
+	return { nodes, buckets, counts, total, params, dropped };
 }
 
 function fmtTok(t: number): string {
@@ -327,13 +485,19 @@ class ContextExplorer implements Component {
 	private sizes = new WeakMap<object, number>();
 	/** The node whose children are the "sections" (payload if present, else the whole dump). */
 	private root: unknown;
-	private rootChars: number;
+	/** Dump path of `root`; only nodes under it count toward context. */
+	private rootPath: Path;
+	private analysis: Analysis;
+	/** Estimated context tokens of the whole payload (equals `measured` when calibrated). */
+	private totalTokens: number;
 	/** Measured prompt tokens from the provider's usage report, if the response has arrived. */
 	private measured?: number;
 	private contextWindow?: number;
 	private compactReserve?: number;
 	private modelName?: string;
-	private tokPerChar: number;
+	/** Tokens per text char, calibrated against `measured` when available. */
+	private tokPerChar = 1 / CHARS_PER_TOKEN;
+	private calibrated = false;
 	private rows: Row[] = [];
 	private cursor = 0;
 	private builtWidth = -1;
@@ -365,8 +529,8 @@ class ContextExplorer implements Component {
 		this.file = file;
 		this.done = done;
 		const dump = state.dump;
+		this.rootPath = isObj(dump.payload) ? ["payload"] : [];
 		this.root = isObj(dump.payload) ? dump.payload : dump;
-		this.rootChars = Math.max(1, this.size(this.root));
 		const meta = (isObj(dump.meta) ? dump.meta : {}) as Record<string, unknown>;
 		const usage = (isObj(dump.usage) ? dump.usage : undefined) as Record<string, unknown> | undefined;
 		const num = (v: unknown) => (typeof v === "number" && Number.isFinite(v) ? v : 0);
@@ -374,16 +538,32 @@ class ContextExplorer implements Component {
 		this.contextWindow = num(meta.contextWindow) || undefined;
 		this.compactReserve = num(meta.compactReserve) || undefined;
 		this.modelName = typeof meta.model === "string" ? meta.model : undefined;
-		// Calibrate char-based estimates against the real token count when we have it.
-		this.tokPerChar = this.measured ? this.measured / this.rootChars : 1 / CHARS_PER_TOKEN;
+		this.analysis = analyze(this.root, this.rootPath, meta);
+		// Calibrate text tokens/char so text + directly estimated tokens add up to the real count.
+		const { chars, fixed } = this.analysis.total;
+		if (this.measured && chars > 0) {
+			const k = (this.measured - fixed) / chars;
+			if (k > 0.05 && k < 1) {
+				this.tokPerChar = k;
+				this.calibrated = true;
+			}
+		}
+		this.totalTokens = Math.max(1, this.cost(this.analysis.total));
 	}
 
-	private tok(v: unknown): number {
-		return this.size(v) * this.tokPerChar;
+	private cost(c: Cost): number {
+		return c.chars * this.tokPerChar + c.fixed;
+	}
+
+	/** Context tokens of the node at `path`; undefined outside the payload (meta, headers, …). */
+	private tokAt(path: Path): number | undefined {
+		if (path.length < this.rootPath.length || this.rootPath.some((s, i) => path[i] !== s)) return undefined;
+		const c = this.analysis.nodes.get(pathId(path));
+		return c ? this.cost(c) : 0;
 	}
 
 	private get usedTokens(): number {
-		return this.measured ?? this.rootChars * this.tokPerChar;
+		return this.measured ?? this.totalTokens;
 	}
 
 	/** Claude Code-style usage summary: cell grid on the left, legend on the right. */
@@ -392,12 +572,12 @@ class ContextExplorer implements Component {
 		const used = this.usedTokens;
 		const win = this.contextWindow;
 
-		const stats = classify(this.root, (v) => this.size(v));
+		const stats = this.analysis;
 		const colored = BUCKETS.map((b) => ({
 			...b,
-			tokens: (stats.chars.get(b.name) ?? 0) * this.tokPerChar,
+			tokens: this.cost(stats.buckets.get(b.name) ?? { chars: 0, fixed: 0 }),
 			count: stats.counts.get(b.name),
-		})).filter((b) => b.tokens >= 1);
+		})).filter((b) => b.tokens >= 1 || b.count);
 		const reserve = win ? Math.min(this.compactReserve ?? 0, Math.max(0, win - used)) : 0;
 		const denom = win ?? used;
 		const pct = (t: number) => {
@@ -412,7 +592,7 @@ class ContextExplorer implements Component {
 			: `${fmtTok(used)} tokens`;
 		legend.push(`${usedStr} ${th.fg("dim", this.measured ? "measured" : "estimated")}`);
 		legend.push("");
-		legend.push(th.fg("muted", th.italic(`${this.measured ? "Measured total, estimated" : "Estimated"} usage by category`)));
+		legend.push(th.fg("muted", th.italic(`${this.calibrated ? "Measured total, estimated split" : "Estimated usage"} by category`)));
 		for (const s of colored) {
 			const cnt = s.count ? th.fg("dim", ` · ${s.count.n} ${s.count.n === 1 ? s.count.unit.replace(/s$/, "") : s.count.unit}`) : "";
 			legend.push(`${th.fg(s.color, "■")} ${s.name}: ${th.fg("muted", `${fmtTok(s.tokens)} (${pct(s.tokens)})`)}${cnt}`);
@@ -424,6 +604,8 @@ class ContextExplorer implements Component {
 			const free = Math.max(0, win - used - reserve);
 			legend.push(`${th.fg("dim", "□")} Free space: ${th.fg("muted", `${fmtTok(free)} (${pct(free)})`)}`);
 		}
+		if (stats.dropped) legend.push(th.fg("dim", `${stats.dropped} earlier-turn thinking blocks dropped by the API`));
+		if (stats.params.length) legend.push(th.fg("dim", `Not in context: ${stats.params.join(", ")}, ids, cache markers`));
 
 		// Grid: each cell is 1/N of the window (or of used tokens if the window is unknown).
 		const gridCols = 10;
@@ -433,6 +615,7 @@ class ContextExplorer implements Component {
 		const n = gridCols * gridRows;
 		const cells: string[] = [];
 		for (const s of colored) {
+			if (s.tokens < 1) continue;
 			const k = Math.max(1, Math.round((s.tokens / Math.max(1, denom)) * n));
 			for (let i = 0; i < k && cells.length < n; i++) cells.push(th.fg(s.color, "■"));
 		}
@@ -458,9 +641,20 @@ class ContextExplorer implements Component {
 		return n;
 	}
 
-	private sortedEntries(v: Record<string, unknown> | unknown[]) {
+	/** Sort weight: context tokens inside the payload, JSON size elsewhere (payload sorts first). */
+	private weight(path: Path, v: unknown): [number, number] {
+		return [this.tokAt(path) ?? -1, this.size(v)];
+	}
+
+	private sortedEntries(v: Record<string, unknown> | unknown[], path: Path) {
 		const e = entries(v);
-		return this.state.sort ? e.sort((a, b) => this.size(b[1]) - this.size(a[1])) : e;
+		if (!this.state.sort) return e;
+		const w = new Map(e.map(([k, x]) => [k, this.weight([...path, k], x)]));
+		return e.sort((a, b) => {
+			const [ta, sa] = w.get(a[0])!;
+			const [tb, sb] = w.get(b[0])!;
+			return tb - ta || sb - sa;
+		});
 	}
 
 	private groupId(path: Path, start: number, end: number) {
@@ -516,12 +710,12 @@ class ContextExplorer implements Component {
 					}
 				}
 			} else if (isObj(value)) {
-				const list = this.sortedEntries(value);
+				const list = this.sortedEntries(value, path);
 				if (Array.isArray(value)) emitRange(list, path, depth + 1, 0, list.length);
 				else for (const [k, v] of list) visit(k, v, [...path, k], depth + 1);
 			}
 		};
-		for (const [k, v] of this.sortedEntries(this.state.dump)) visit(k, v, [k], 0);
+		for (const [k, v] of this.sortedEntries(this.state.dump, [])) visit(k, v, [k], 0);
 		this.rows = rows;
 		this.builtWidth = width;
 		const idx = this.state.cursorId ? rows.findIndex((r) => r.id === this.state.cursorId) : -1;
@@ -620,7 +814,7 @@ class ContextExplorer implements Component {
 					out.push({ seq: mySeq, target: id, expand: ancestors, occurrence: k });
 				}
 			} else if (isObj(value)) {
-				const list = this.sortedEntries(value);
+				const list = this.sortedEntries(value, path);
 				const inner = [...ancestors, id];
 				list.forEach(([k, v], pos) => {
 					const groups = Array.isArray(value) ? this.groupChain(path, list.length, pos) : [];
@@ -630,7 +824,7 @@ class ContextExplorer implements Component {
 				out.push({ seq: mySeq, target: id, expand: ancestors });
 			}
 		};
-		for (const [k, v] of this.sortedEntries(this.state.dump)) walk(k, v, [k], []);
+		for (const [k, v] of this.sortedEntries(this.state.dump, [])) walk(k, v, [k], []);
 		return out;
 	}
 
@@ -859,10 +1053,13 @@ class ContextExplorer implements Component {
 		return first === last ? `[${first}]` : `[${first}…${last}]`;
 	}
 
-	private stats(chars: number, width: number): string {
+	/** Token/percent/bar column. Blank outside the payload; "—" for payload parts not in context. */
+	private stats(tokens: number | undefined, width: number): string {
 		const th = this.theme;
-		const pct = (chars / this.rootChars) * 100;
-		const tok = `~${fmtTok(chars * this.tokPerChar)}`.padStart(7);
+		if (tokens === undefined) return "";
+		if (tokens < 0.5) return th.fg("dim", "—".padStart(7) + (width < 40 ? "" : " ".repeat(12)));
+		const pct = (tokens / this.totalTokens) * 100;
+		const tok = `~${fmtTok(tokens)}`.padStart(7);
 		const pctStr = (pct >= 1 ? `${Math.round(pct)}%` : "").padStart(4);
 		if (width < 40) return th.fg("dim", tok);
 		const cells = 6;
@@ -900,9 +1097,10 @@ class ContextExplorer implements Component {
 			line = truncateToWidth(line, inner, "…", true);
 		} else if (row.kind === "group") {
 			const open = this.state.expanded.has(row.id);
-			const chars = (row.items ?? []).reduce((n, [, v]) => n + this.size(v), 0);
+			const toks = (row.items ?? []).map(([k]) => this.tokAt([...row.path, k]));
+			const tokens = toks.every((t) => t === undefined) ? undefined : toks.reduce<number>((n, t) => n + (t ?? 0), 0);
 			const left = `${indent}${th.fg("accent", open ? "▾" : "▸")} ${th.fg("muted", this.groupLabel(row))} ${th.fg("dim", `(${row.items?.length ?? 0})`)}`;
-			const stats = this.stats(chars, inner);
+			const stats = this.stats(tokens, inner);
 			line = `${truncateToWidth(left, Math.max(4, inner - visibleWidth(stats) - 1), "…", true)} ${stats}`;
 		} else {
 			const v = row.value;
@@ -933,8 +1131,8 @@ class ContextExplorer implements Component {
 			}
 			const sep = row.expandable || isObj(v) ? " " : th.fg("dim", ": ");
 			const left = `${indent}${marker} ${keyStr}${sep}${summary}`;
-			if (showStats) {
-				const stats = this.stats(this.size(v), inner);
+			const stats = showStats ? this.stats(this.tokAt(row.path), inner) : "";
+			if (stats) {
 				const leftW = Math.max(4, inner - visibleWidth(stats) - 1);
 				line = `${truncateToWidth(left, leftW, "…", true)} ${stats}`;
 			} else {
